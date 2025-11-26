@@ -1,0 +1,9 @@
+#pragma once
+#include <Windows.h>
+#include <iostream>
+#include <thread>
+#include "SDK/Engine_classes.hpp"
+#include "SDK/Engine_parameters.hpp"
+#include "SDK/Engine_structs.hpp"
+#include "SDK/Mordhau_classes.hpp"
+#include "MinHook.h"
