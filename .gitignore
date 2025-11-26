@@ -1,0 +1,26 @@
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.vcxproj.filters
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build results
+Debug/
+Release/
+x64/
+x86/
+build/
+bin/
+obj/
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.dll
+*.exe
+
+# MinHook (if built from source or temp files)
+*.log

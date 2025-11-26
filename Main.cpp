@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 
 // ОТКЛЮЧЕНИЕ МУСОРНЫХ ВАРНИНГОВ SDK
 #pragma warning(disable: 4369)
@@ -16,6 +16,8 @@
 #include <thread>
 #include <algorithm> 
 #include <cstdio> // Явно включаем для freopen
+
+#include "MinHook.h"
 
 // ПОДКЛЮЧЕНИЕ ТВОЕГО SDK
 #include "SDK/Engine_classes.hpp"
@@ -258,6 +260,57 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
     Log("--- TICK END ---");
 }
 
+// =================================================================================
+// 🪝 HOOKING
+// =================================================================================
+
+typedef void(*ExecOnHitFunc)(void* Context, void* Stack, void* Result);
+ExecOnHitFunc OriginalExecOnHit = nullptr;
+
+uintptr_t PatternScan(const char* signature, const char* mask) {
+    static uintptr_t base = (uintptr_t)GetModuleHandle(NULL);
+    static PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    static PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    static uintptr_t size = nt->OptionalHeader.SizeOfImage;
+
+    uintptr_t patternLength = strlen(mask);
+    for (uintptr_t i = 0; i < size - patternLength; i++) {
+        bool found = true;
+        for (uintptr_t j = 0; j < patternLength; j++) {
+            if (mask[j] != '?' && signature[j] != *(char*)(base + i + j)) {
+                found = false;
+                break;
+            }
+        }
+        if (found) return base + i;
+    }
+    return 0;
+}
+
+void HK_ExecOnHit(void* Context, void* Stack, void* Result) {
+    // 1. Call Original
+    if (OriginalExecOnHit) {
+        OriginalExecOnHit(Context, Stack, Result);
+    }
+
+    // 2. Logic: If local player got hit -> PressParry()
+    if (Config::bEnabled && Context) {
+        SDK::UObject* Obj = static_cast<SDK::UObject*>(Context);
+        
+        // We need to check if this is the local player.
+        // We can access GWorld via SDK::UWorld::GetWorld().
+        SDK::UWorld* World = SDK::UWorld::GetWorld();
+        if (World && World->OwningGameInstance && World->OwningGameInstance->LocalPlayers.IsValidIndex(0)) {
+            auto LP = World->OwningGameInstance->LocalPlayers[0];
+            if (LP && LP->PlayerController && LP->PlayerController->Pawn) {
+                 if (LP->PlayerController->Pawn == Obj) {
+                     Log("[RAGE PARRY] Local Player Hit Detected! Triggering Parry.");
+                     PressParry();
+                 }
+            }
+        }
+    }
+}
 
 // =================================================================================
 // 🚀 MAIN THREAD 
@@ -281,6 +334,31 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     // SDK::UEngine::GetEngine(); 
 
     std::cout << "[SUCCESS] Ready! Press F3(Parry), F4(Debug), END(Unload).\n";
+
+    // --- HOOK INSTALLATION ---
+    std::cout << "[HOOK] Initializing MinHook...\n";
+    if (MH_Initialize() != MH_OK) {
+        std::cout << "[HOOK] Failed to initialize MinHook (might be already initialized).\n";
+    }
+
+    const char* Sig = "\x48\x89\x5C\x24\x00\x56\x57\x41\x56\x48\x83\xEC\x00\x33\xFF\x48\x8B\xDA\x48\x89\x7C\x24\x00\x4C\x8B\xF1\xE8\x00\x00\x00\x00\x48\x8B\xCB\x48\x39\x7B\x00\x74\x00\x48\x8B\x53\x00\x4C\x8D\x44\x24\x00\xE8\x00\x00\x00\x00\xEB\x00\x4C\x8B\x83\x00\x00\x00\x00\x48\x8D\x54\x24\x00\x49\x8B\x40\x00\x48\x89\x83\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x89\xBC\x24";
+    const char* Mask = "xxxx?xxxxxxx?xxxxxxxxx?xxxx????xxxxxx?x?xxx?xxxx?x????x?xxx????xxxx?xxx?xxx????x????xxxx";
+
+    std::cout << "[HOOK] Scanning for execOnHit...\n";
+    uintptr_t ExecOnHitAddr = PatternScan(Sig, Mask);
+    if (ExecOnHitAddr) {
+        std::cout << "[HOOK] Found execOnHit at: " << std::hex << ExecOnHitAddr << std::dec << "\n";
+        MH_STATUS status = MH_CreateHook((LPVOID)ExecOnHitAddr, (LPVOID)HK_ExecOnHit, (LPVOID*)&OriginalExecOnHit);
+        if (status == MH_OK) {
+            MH_EnableHook((LPVOID)ExecOnHitAddr);
+            std::cout << "[HOOK] execOnHit Hooked Successfully!\n";
+        } else {
+            std::cout << "[HOOK] Failed to create hook: " << MH_StatusToString(status) << "\n";
+        }
+    } else {
+        std::cout << "[HOOK] FAILED to find execOnHit pattern!\n";
+    }
+    // -------------------------
 
     float PingCompensation = Config::SimulatedPing * 0.65f;
     float FinalTriggerDist = Config::SafeMargin + PingCompensation;
@@ -313,6 +391,10 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+
+    // Cleanup
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
 
     FreeConsole();
     FreeLibraryAndExitThread(hModule, 0);
