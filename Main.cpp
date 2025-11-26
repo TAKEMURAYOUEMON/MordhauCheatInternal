@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 
 // ОТКЛЮЧЕНИЕ МУСОРНЫХ ВАРНИНГОВ SDK
 #pragma warning(disable: 4369)
@@ -16,6 +16,8 @@
 #include <thread>
 #include <algorithm> 
 #include <cstdio> // Явно включаем для freopen
+
+#include "MinHook.h"
 
 // ПОДКЛЮЧЕНИЕ ТВОЕГО SDK
 #include "SDK/Engine_classes.hpp"
@@ -104,6 +106,78 @@ void PressParry() {
 }
 
 // =================================================================================
+// 🕵️ PATTERN SCANNER & HOOKS
+// =================================================================================
+
+uintptr_t PatternScan(uintptr_t moduleBase, size_t moduleSize, const char* signature, const char* mask) {
+    size_t sigLen = strlen(mask);
+    for (size_t i = 0; i < moduleSize - sigLen; i++) {
+        bool found = true;
+        for (size_t j = 0; j < sigLen; j++) {
+            if (mask[j] != '?' && signature[j] != *(char*)(moduleBase + i + j)) {
+                found = false;
+                break;
+            }
+        }
+        if (found) {
+            return moduleBase + i;
+        }
+    }
+    return 0;
+}
+
+typedef void(__fastcall* OnHit_t)(SDK::AMordhauCharacter* This, SDK::AActor* Actor, SDK::FName Bone, const SDK::FVector& WorldLocation, uint8_t Tier, uint8_t SurfaceType);
+OnHit_t OriginalOnHit = nullptr;
+
+void __fastcall Hook_OnHit(SDK::AMordhauCharacter* This, SDK::AActor* Actor, SDK::FName Bone, const SDK::FVector& WorldLocation, uint8_t Tier, uint8_t SurfaceType) {
+    if (Config::bDebugMode && Actor) {
+        // Log the hit for debugging purposes as requested in the ticket
+        Log("Pattern scan found OnHit hook fired! Attacker: %s", Actor->GetName().c_str());
+    }
+
+    if (OriginalOnHit) {
+        OriginalOnHit(This, Actor, Bone, WorldLocation, Tier, SurfaceType);
+    }
+}
+
+void InstallHooks() {
+    if (MH_Initialize() != MH_OK) {
+        Log("Failed to initialize MinHook.");
+        return;
+    }
+
+    HMODULE hModule = GetModuleHandle(NULL);
+    if (!hModule) {
+        Log("Failed to get module handle.");
+        return;
+    }
+
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((uint8_t*)hModule + dosHeader->e_lfanew);
+    DWORD moduleSize = ntHeaders->OptionalHeader.SizeOfImage;
+
+    const char* signature = "\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x00\x41\x8B\x41\x00\x48\x8B\xF9\x00\x00\x00\x00\x00\x00\x00\x00\x89\x44\x24\x00\x0F\xB6\x44\x24";
+    const char* mask = "xxxx?xxxx?xxx?xxx????????xxx?xxxx";
+
+    uintptr_t onHitAddress = PatternScan((uintptr_t)hModule, moduleSize, signature, mask);
+
+    if (onHitAddress) {
+        Log("Pattern scan found OnHit at: 0x%p", (void*)onHitAddress);
+        MH_STATUS status = MH_CreateHook((LPVOID)onHitAddress, (LPVOID)&Hook_OnHit, (LPVOID*)&OriginalOnHit);
+        if (status == MH_OK) {
+            MH_EnableHook((LPVOID)onHitAddress);
+            Log("Hook installed successfully.");
+        }
+        else {
+            Log("MinHook failed to create hook: %s", MH_StatusToString(status));
+        }
+    }
+    else {
+        Log("Pattern scan FAILED to find OnHit!");
+    }
+}
+
+// =================================================================================
 // ⚔️ ЛОГИКА
 // =================================================================================
 
@@ -129,8 +203,8 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
     if (LocalChar->MotionSystemComponent && LocalChar->MotionSystemComponent->Motion) {
         auto LocalMotion = LocalChar->MotionSystemComponent->Motion;
         if (LocalMotion->IsA(SDK::UAttackMotion::StaticClass())) {
-            Log("  [LOCAL CHECK FAILED] Local Character is already attacking/riposting. (Skipping Parry)");
-            Log("--- TICK END --- (Local Lock)");
+            // Log("  [LOCAL CHECK FAILED] Local Character is already attacking/riposting. (Skipping Parry)");
+            // Log("--- TICK END --- (Local Lock)");
             return;
         }
     }
@@ -143,8 +217,8 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
 
     SDK::TArray<SDK::AActor*>& Actors = World->PersistentLevel->Actors;
 
-    Log("--- TICK START | Actors: %d | Trigger Dist: %.1f (Margin %.1f + PingComp %.1f) ---",
-        Actors.Num(), FinalTriggerDist, Config::SafeMargin, PingCompensation);
+    // Log("--- TICK START | Actors: %d | Trigger Dist: %.1f (Margin %.1f + PingComp %.1f) ---",
+    //    Actors.Num(), FinalTriggerDist, Config::SafeMargin, PingCompensation);
 
     for (int i = 0; i < Actors.Num(); i++) {
         SDK::AActor* Actor = Actors[i];
@@ -161,13 +235,13 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
             continue;
         }
 
-        Log("=================================================================");
-        Log("[ENEMY] %s (Dist: %.1f)", Enemy->GetName().c_str(), CurrentDist);
+        // Log("=================================================================");
+        // Log("[ENEMY] %s (Dist: %.1f)", Enemy->GetName().c_str(), CurrentDist);
 
         // 4. ПРОВЕРКА ОРУЖИЯ
         SDK::AMordhauEquipment* EnemyEquipment = Enemy->RightHandEquipment;
         if (!EnemyEquipment || !EnemyEquipment->IsA(SDK::AMordhauWeapon::StaticClass())) {
-            Log("  [CHECK FAILED] No Weapon or Not a Weapon.");
+            // Log("  [CHECK FAILED] No Weapon or Not a Weapon.");
             continue;
         }
 
@@ -175,14 +249,14 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
         auto WeaponMesh = EnemyWeapon->SkeletalMeshComponent;
 
         if (!WeaponMesh) {
-            Log("  [CRITICAL CHECK FAILED] No Weapon Mesh found.");
+            // Log("  [CRITICAL CHECK FAILED] No Weapon Mesh found.");
             continue;
         }
 
         // 5. ИЕРАРХИЯ MotionSystem 
         auto EnemyMotionSystem = Enemy->MotionSystemComponent;
         if (!EnemyMotionSystem || !EnemyMotionSystem->Motion || !EnemyMotionSystem->Motion->IsA(SDK::UAttackMotion::StaticClass())) {
-            Log("  [CHECK FAILED] Enemy is not in an AttackMotion.");
+            // Log("  [CHECK FAILED] Enemy is not in an AttackMotion.");
             continue;
         }
 
@@ -192,12 +266,12 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
 
         EAttackStage AttackStage = *reinterpret_cast<EAttackStage*>(MotionAddress + ATTACK_STAGE_OFFSET);
 
-        Log("  [ATTACK STATE] Stage: %d (%s)", (int)AttackStage, GetAttackStageName(AttackStage));
+        // Log("  [ATTACK STATE] Stage: %d (%s)", (int)AttackStage, GetAttackStageName(AttackStage));
 
         // ⚠️ ГЛАВНАЯ ПРОВЕРКА АНТИ-ФИНТА: Парируем ТОЛЬКО в Release.
         if (AttackStage != EAttackStage::Release) {
-            Log("  [CHECK FAILED] State is not Release (Windup/Recovery). Waiting for committed attack. (Skipping)");
-            Log("=================================================================");
+            // Log("  [CHECK FAILED] State is not Release (Windup/Recovery). Waiting for committed attack. (Skipping)");
+            // Log("=================================================================");
             continue;
         }
 
@@ -255,7 +329,7 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
             Log("  [CHECK FAILED] Too far (Min Dist: %.1f > %.1f).", MinBodyDistance, FinalTriggerDist);
         }
     }
-    Log("--- TICK END ---");
+    // Log("--- TICK END ---");
 }
 
 
@@ -279,6 +353,10 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     }
     // Если твой SDK требует инициализации GEngine, то раскомментируй, если нет - оставь закомментированным:
     // SDK::UEngine::GetEngine(); 
+
+    // Install Hooks
+    std::cout << "[INFO] Installing Hooks...\n";
+    InstallHooks();
 
     std::cout << "[SUCCESS] Ready! Press F3(Parry), F4(Debug), END(Unload).\n";
 
@@ -314,6 +392,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
+    MH_Uninitialize();
     FreeConsole();
     FreeLibraryAndExitThread(hModule, 0);
     return 0;
