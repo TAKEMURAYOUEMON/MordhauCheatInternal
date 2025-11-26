@@ -1,64 +1,47 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
-
-// ОТКЛЮЧЕНИЕ МУСОРНЫХ ВАРНИНГОВ SDK
+#define _CRT_SECURE_NO_WARNINGS
 #pragma warning(disable: 4369)
 #pragma warning(disable: 4309)
 #pragma warning(disable: 4244)
 #pragma warning(disable: 4616)
 #pragma warning(disable: 2039) 
 
-#include <Windows.h>
-#include <iostream>
+#include "include.h"
+#include <atomic>
 #include <vector>
-#include <cmath>
 #include <string>
 #include <chrono>
 #include <thread>
-#include <algorithm> 
-#include <cstdio> // Явно включаем для freopen
+#include <cmath>
+#include <cstdio>
+#include <cstdarg>
 
-// ПОДКЛЮЧЕНИЕ ТВОЕГО SDK
-#include "SDK/Engine_classes.hpp"
-#include "SDK/Engine_parameters.hpp"
-#include "SDK/Engine_structs.hpp"
-#include "SDK/Mordhau_classes.hpp"
-
+// Define M_PI if not defined
+#ifndef M_PI
 #define M_PI 3.1415926535f
+#endif
 
-// =================================================================================
-// 🚨 ИНФОРМАЦИЯ ИЗ SDK ПОЛЬЗОВАТЕЛЯ
-// =================================================================================
-
-// Enum Mordhau.EAttackStage (по информации пользователя)
-enum class EAttackStage : uint8_t
-{
-    Windup = 0,
-    Release = 1,
-    Recovery = 2,
-    EAttackStage_MAX = 3
-};
-
-// =================================================================================
-// ⚙️ КОНФИГУРАЦИЯ
-// =================================================================================
+// Globals
+namespace Globals {
+    std::atomic<SDK::UWorld*> World{ nullptr };
+    std::atomic<SDK::AMordhauCharacter*> LocalCharacter{ nullptr };
+    std::atomic<SDK::APlayerController*> LocalController{ nullptr };
+    std::atomic<bool> bAutoParryEnabled{ true };
+    std::atomic<bool> bDebugMode{ true };
+    
+    // Cached FNames for optimization
+    SDK::FName NameReceiveTick;
+    SDK::FName NameTick;
+    SDK::FName NameBPTick;
+    SDK::FName NameUpdateAnim;
+}
 
 namespace Config {
-    bool bEnabled = true;
-    bool bDebugMode = true;
-
-    // --- НАСТРОЙКИ ТОЧНОСТИ ---
-    // Увеличенный запас для компенсации пинга. (80.0f + 52.0f = 132.0f триггер при 80 пинга)
     float SafeMargin = 80.0f;
     float SimulatedPing = 80.0f;
-
-    // Фильтр угла: Отсекает Windup, направленный далеко от нас.
     float MaxAngle = 0.2f;
 }
 
-// =================================================================================
-// 🛠 МАТЕМАТИКА И УТИЛИТЫ
-// =================================================================================
-
+// Math & Utils
 float GetDistance(SDK::FVector v1, SDK::FVector v2) {
     float dx = v1.X - v2.X;
     float dy = v1.Y - v2.Y;
@@ -78,18 +61,18 @@ float DotProduct(SDK::FVector v1, SDK::FVector v2) {
     return v1_norm.X * v2_norm.X + v1_norm.Y * v2_norm.Y + v1_norm.Z * v2_norm.Z;
 }
 
-const char* GetAttackStageName(EAttackStage Stage) {
+const char* GetAttackStageName(SDK::EAttackStage Stage) {
     switch (Stage) {
-    case EAttackStage::Windup: return "Windup (0)";
-    case EAttackStage::Release: return "Release (1)";
-    case EAttackStage::Recovery: return "Recovery (2)";
-    case EAttackStage::EAttackStage_MAX: return "MAX (3)";
+    case SDK::EAttackStage::Windup: return "Windup (0)";
+    case SDK::EAttackStage::Release: return "Release (1)";
+    case SDK::EAttackStage::Recovery: return "Recovery (2)";
+    case SDK::EAttackStage::EAttackStage_MAX: return "MAX (3)";
     default: return "Unknown";
     }
 }
 
 void Log(const char* fmt, ...) {
-    if (!Config::bDebugMode) return;
+    if (!Globals::bDebugMode) return;
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
@@ -98,22 +81,52 @@ void Log(const char* fmt, ...) {
 }
 
 void PressParry() {
-    // Чистый WinAPI для симуляции нажатия правой кнопки мыши
     mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
     mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
 }
 
-// =================================================================================
-// ⚔️ ЛОГИКА
-// =================================================================================
+// Process Logic
+void ProcessCharacter(SDK::AMordhauCharacter* LocalChar, SDK::AMordhauCharacter* Enemy) {
+    if (!LocalChar || !Enemy || LocalChar == Enemy) return;
 
-void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::APlayerController* PlayerController) {
-    if (!World || !LocalChar || !LocalChar->Mesh || !PlayerController) return;
+    // 0. RIPOSTE/ATTACK LOCK CHECK
+    if (LocalChar->MotionSystemComponent && LocalChar->MotionSystemComponent->Motion) {
+        auto LocalMotion = LocalChar->MotionSystemComponent->Motion;
+        if (LocalMotion->IsA(SDK::UAttackMotion::StaticClass())) {
+            return;
+        }
+    }
 
-    // КРИТИЧЕСКИЙ ОФФСЕТ (для AttackStage)
-    const int ATTACK_STAGE_OFFSET = 0x10E9;
+    SDK::FVector LocalCharLocation = LocalChar->K2_GetActorLocation();
 
-    // КРИТИЧЕСКИЕ ТОЧКИ ТЕЛА (СОКЕТЫ/КОСТИ)
+    // 1. Distance Calculation
+    float PingCompensation = Config::SimulatedPing * 0.65f;
+    float FinalTriggerDist = Config::SafeMargin + PingCompensation;
+
+    float CurrentDist = GetDistance(Enemy->K2_GetActorLocation(), LocalCharLocation);
+    if (CurrentDist > 500.0f || Enemy->Health <= 0.0f) return;
+
+    // 4. Check Weapon
+    SDK::AMordhauEquipment* EnemyEquipment = Enemy->RightHandEquipment;
+    if (!EnemyEquipment || !EnemyEquipment->IsA(SDK::AMordhauWeapon::StaticClass())) return;
+    
+    SDK::AMordhauWeapon* EnemyWeapon = static_cast<SDK::AMordhauWeapon*>(EnemyEquipment);
+    auto WeaponMesh = EnemyWeapon->SkeletalMeshComponent;
+    if (!WeaponMesh) return;
+
+    // 5. Motion System
+    auto EnemyMotionSystem = Enemy->MotionSystemComponent;
+    if (!EnemyMotionSystem || !EnemyMotionSystem->Motion || !EnemyMotionSystem->Motion->IsA(SDK::UAttackMotion::StaticClass())) return;
+
+    // 6. Attack Phase
+    const int ATTACK_STAGE_OFFSET = 0x10E9; // Offset from original code
+    SDK::UAttackMotion* AttackMotion = static_cast<SDK::UAttackMotion*>(EnemyMotionSystem->Motion);
+    uintptr_t MotionAddress = (uintptr_t)AttackMotion;
+    SDK::EAttackStage AttackStage = *reinterpret_cast<SDK::EAttackStage*>(MotionAddress + ATTACK_STAGE_OFFSET);
+
+    if (AttackStage != SDK::EAttackStage::Release) return;
+
+    // 7. Geometry
     static SDK::FName nHead = SDK::UKismetStringLibrary::Conv_StringToName(L"Head");
     static SDK::FName nHandL = SDK::UKismetStringLibrary::Conv_StringToName(L"hand_l");
     static SDK::FName nHandR = SDK::UKismetStringLibrary::Conv_StringToName(L"hand_r");
@@ -121,198 +134,150 @@ void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::A
     static SDK::FName nFootR = SDK::UKismetStringLibrary::Conv_StringToName(L"foot_r");
     static SDK::FName nSpine = SDK::UKismetStringLibrary::Conv_StringToName(L"spine_03");
 
-    // ТОЧКИ ОРУЖИЯ
     static SDK::FName nTraceEnd = SDK::UKismetStringLibrary::Conv_StringToName(L"TraceEnd");
     static SDK::FName nTraceStart = SDK::UKismetStringLibrary::Conv_StringToName(L"TraceStart");
 
-    // 0. RIPOSTE/ATTACK LOCK CHECK (Проверка, что мы сами не атакуем)
-    if (LocalChar->MotionSystemComponent && LocalChar->MotionSystemComponent->Motion) {
-        auto LocalMotion = LocalChar->MotionSystemComponent->Motion;
-        if (LocalMotion->IsA(SDK::UAttackMotion::StaticClass())) {
-            Log("  [LOCAL CHECK FAILED] Local Character is already attacking/riposting. (Skipping Parry)");
-            Log("--- TICK END --- (Local Lock)");
-            return;
-        }
+    SDK::FVector TipPos = WeaponMesh->GetSocketLocation(nTraceEnd);
+    SDK::FVector BasePos = WeaponMesh->GetSocketLocation(nTraceStart);
+
+    SDK::FVector TargetPos = (GetDistance(TipPos, LocalCharLocation) < GetDistance(BasePos, LocalCharLocation)) ? TipPos : BasePos;
+
+    std::vector<SDK::FName> CriticalSockets = { nHead, nHandL, nHandR, nFootL, nFootR, nSpine };
+    float MinBodyDistance = 99999.0f;
+
+    for (const auto& SocketName : CriticalSockets) {
+        SDK::FVector BodyPoint = LocalChar->Mesh->GetSocketLocation(SocketName);
+        float dist = GetDistance(TargetPos, BodyPoint);
+        if (dist < MinBodyDistance) MinBodyDistance = dist;
     }
 
-    SDK::FVector LocalCharLocation = LocalChar->K2_GetActorLocation();
+    if (MinBodyDistance < FinalTriggerDist) {
+        SDK::FVector DirToMe = LocalCharLocation - Enemy->K2_GetActorLocation();
+        SDK::FVector EnemyFwd = Enemy->GetActorForwardVector();
 
-    // 1. РАСЧЕТ ДИСТАНСИИ ТРИГГЕРА
-    float PingCompensation = Config::SimulatedPing * 0.65f;
-    float FinalTriggerDist = Config::SafeMargin + PingCompensation;
-
-    SDK::TArray<SDK::AActor*>& Actors = World->PersistentLevel->Actors;
-
-    Log("--- TICK START | Actors: %d | Trigger Dist: %.1f (Margin %.1f + PingComp %.1f) ---",
-        Actors.Num(), FinalTriggerDist, Config::SafeMargin, PingCompensation);
-
-    for (int i = 0; i < Actors.Num(); i++) {
-        SDK::AActor* Actor = Actors[i];
-
-        if (!Actor || Actor == LocalChar || !Actor->IsA(SDK::AMordhauCharacter::StaticClass())) {
-            continue;
-        }
-
-        SDK::AMordhauCharacter* Enemy = static_cast<SDK::AMordhauCharacter*>(Actor);
-
-        float CurrentDist = GetDistance(Enemy->K2_GetActorLocation(), LocalCharLocation);
-
-        if (CurrentDist > 500.0f || Enemy->Health <= 0.0f) {
-            continue;
-        }
-
-        Log("=================================================================");
-        Log("[ENEMY] %s (Dist: %.1f)", Enemy->GetName().c_str(), CurrentDist);
-
-        // 4. ПРОВЕРКА ОРУЖИЯ
-        SDK::AMordhauEquipment* EnemyEquipment = Enemy->RightHandEquipment;
-        if (!EnemyEquipment || !EnemyEquipment->IsA(SDK::AMordhauWeapon::StaticClass())) {
-            Log("  [CHECK FAILED] No Weapon or Not a Weapon.");
-            continue;
-        }
-
-        SDK::AMordhauWeapon* EnemyWeapon = static_cast<SDK::AMordhauWeapon*>(EnemyEquipment);
-        auto WeaponMesh = EnemyWeapon->SkeletalMeshComponent;
-
-        if (!WeaponMesh) {
-            Log("  [CRITICAL CHECK FAILED] No Weapon Mesh found.");
-            continue;
-        }
-
-        // 5. ИЕРАРХИЯ MotionSystem 
-        auto EnemyMotionSystem = Enemy->MotionSystemComponent;
-        if (!EnemyMotionSystem || !EnemyMotionSystem->Motion || !EnemyMotionSystem->Motion->IsA(SDK::UAttackMotion::StaticClass())) {
-            Log("  [CHECK FAILED] Enemy is not in an AttackMotion.");
-            continue;
-        }
-
-        // 6. ФАЗА АТАКИ (АНТИ-ФИНТ ЛОГИКА - СТРОГИЙ RELEASE)
-        SDK::UAttackMotion* AttackMotion = static_cast<SDK::UAttackMotion*>(EnemyMotionSystem->Motion);
-        uintptr_t MotionAddress = (uintptr_t)AttackMotion;
-
-        EAttackStage AttackStage = *reinterpret_cast<EAttackStage*>(MotionAddress + ATTACK_STAGE_OFFSET);
-
-        Log("  [ATTACK STATE] Stage: %d (%s)", (int)AttackStage, GetAttackStageName(AttackStage));
-
-        // ⚠️ ГЛАВНАЯ ПРОВЕРКА АНТИ-ФИНТА: Парируем ТОЛЬКО в Release.
-        if (AttackStage != EAttackStage::Release) {
-            Log("  [CHECK FAILED] State is not Release (Windup/Recovery). Waiting for committed attack. (Skipping)");
-            Log("=================================================================");
-            continue;
-        }
-
-        Log("  [COMMITMENT OK] State is Release! Checking Geometry.");
-
-        // 7. ГЕОМЕТРИЯ - ПОИСК МИНИМАЛЬНОЙ БЛИЗОСТИ К ТЕЛУ
-
-        SDK::FVector TipPos = WeaponMesh->GetSocketLocation(nTraceEnd);
-        SDK::FVector BasePos = WeaponMesh->GetSocketLocation(nTraceStart);
-
-        // Выбираем ближайшую точку оружия к нам
-        SDK::FVector TargetPos = (GetDistance(TipPos, LocalCharLocation) < GetDistance(BasePos, LocalCharLocation)) ? TipPos : BasePos;
-
-        // Список сокетов для проверки 
-        std::vector<SDK::FName> CriticalSockets = { nHead, nHandL, nHandR, nFootL, nFootR, nSpine };
-        float MinBodyDistance = 99999.0f;
-
-        for (const auto& SocketName : CriticalSockets) {
-            SDK::FVector BodyPoint = LocalChar->Mesh->GetSocketLocation(SocketName);
-            float dist = GetDistance(TargetPos, BodyPoint);
-
-            if (dist < MinBodyDistance) {
-                MinBodyDistance = dist;
-            }
-        }
-
-        // Триггер теперь 132.0f
-        Log("  [GEOM] Closest Dist (to Body Point): %.1f (Trigger: %.1f)", MinBodyDistance, FinalTriggerDist);
-
-        // 8. ТРИГГЕР ДИСТАНЦИИ И УГЛА
-        if (MinBodyDistance < FinalTriggerDist) {
-            Log("  [CHECK OK] Distance Triggered (%.1f < %.1f).", MinBodyDistance, FinalTriggerDist);
-
-            // Расчет угла для атаки (для фильтрации замахов, направленных в сторону)
-            SDK::FVector DirToMe = LocalCharLocation - Enemy->K2_GetActorLocation();
-            SDK::FVector EnemyFwd = Enemy->GetActorForwardVector();
-
-            float AngleDot = DotProduct(EnemyFwd, DirToMe);
-            Log("  [ANGLE] Dot Product: %.2f (Required > %.2f)", AngleDot, Config::MaxAngle);
-
-            if (AngleDot > Config::MaxAngle) {
-
-                // ФИНАЛЬНЫЙ ТРИГГЕР: ПАРИРОВАНИЕ
-                PressParry();
-
-                Log("  [SUCCESS] PARRY TRIGGERED! Dist: %.2f", MinBodyDistance);
-                Log("=================================================================");
-                return;
-            }
-            else {
-                Log("  [CHECK FAILED] Angle too wide (Dot: %.2f).", AngleDot);
-            }
-        }
-        else {
-            Log("  [CHECK FAILED] Too far (Min Dist: %.1f > %.1f).", MinBodyDistance, FinalTriggerDist);
+        float AngleDot = DotProduct(EnemyFwd, DirToMe);
+        
+        if (AngleDot > Config::MaxAngle) {
+            PressParry();
+            Log("[HOOK] PARRY TRIGGERED! Dist: %.2f | Enemy: %s", MinBodyDistance, Enemy->GetName().c_str());
         }
     }
-    Log("--- TICK END ---");
 }
 
+// Hook
+typedef void(__thiscall* ProcessEvent_t)(SDK::UObject*, SDK::UFunction*, void*);
+ProcessEvent_t oProcessEvent = nullptr;
 
-// =================================================================================
-// 🚀 MAIN THREAD 
-// =================================================================================
+void __fastcall hkProcessEvent(SDK::UObject* Object, SDK::UFunction* Function, void* Params) {
+    if (Globals::bAutoParryEnabled) {
+        // Optimization: Filter by function name index
+        if (Object && Object->IsA(SDK::AMordhauCharacter::StaticClass())) {
+            
+            // Check if it's "ReceiveTick" or similar
+            if (Function->Name == Globals::NameReceiveTick || 
+                Function->Name == Globals::NameTick || 
+                Function->Name == Globals::NameBPTick ||
+                Function->Name == Globals::NameUpdateAnim) {
+                
+                SDK::AMordhauCharacter* Character = static_cast<SDK::AMordhauCharacter*>(Object);
+                SDK::AMordhauCharacter* Local = Globals::LocalCharacter.load();
+                
+                if (Local && Character != Local) {
+                    ProcessCharacter(Local, Character);
+                }
+            }
+        }
+    }
 
+    return oProcessEvent(Object, Function, Params);
+}
+
+// Main Thread
 DWORD WINAPI MainThread(LPVOID lpParam) {
     HMODULE hModule = static_cast<HMODULE>(lpParam);
     AllocConsole();
-    // ⚠️ ИСПРАВЛЕНИЕ ОШИБКИ C2064: Используем freopen для большей стабильности
     (void)freopen("CONOUT$", "w", stdout);
 
     std::cout << "[INFO] Waiting for Game Engine...\n";
 
     SDK::UWorld* World = nullptr;
-
     while (!World) {
         World = SDK::UWorld::GetWorld();
         Sleep(100);
     }
-    // Если твой SDK требует инициализации GEngine, то раскомментируй, если нет - оставь закомментированным:
-    // SDK::UEngine::GetEngine(); 
+    Globals::World = World;
 
-    std::cout << "[SUCCESS] Ready! Press F3(Parry), F4(Debug), END(Unload).\n";
+    // Initialize FNames for the hook
+    Globals::NameReceiveTick = SDK::UKismetStringLibrary::Conv_StringToName(L"ReceiveTick");
+    Globals::NameTick = SDK::UKismetStringLibrary::Conv_StringToName(L"Tick");
+    Globals::NameBPTick = SDK::UKismetStringLibrary::Conv_StringToName(L"K2_Tick"); 
+    Globals::NameUpdateAnim = SDK::UKismetStringLibrary::Conv_StringToName(L"BlueprintUpdateAnimation");
 
-    float PingCompensation = Config::SimulatedPing * 0.65f;
-    float FinalTriggerDist = Config::SafeMargin + PingCompensation;
+    std::cout << "[SUCCESS] World found. Installing Hooks...\n";
+    
+    // Install Hook
+    uintptr_t ProcessEventAddr = SDK::InSDKUtils::GetImageBase() + SDK::Offsets::ProcessEvent;
+    
+    if (MH_Initialize() != MH_OK) {
+        std::cout << "[ERROR] MinHook Initialize failed.\n";
+        return 1;
+    }
 
-    std::cout << "[CONFIG] Final Trigger Dist: " << FinalTriggerDist << " (Margin: " << Config::SafeMargin << " + Ping Comp: " << PingCompensation << ")\n";
+    if (MH_CreateHook((LPVOID)ProcessEventAddr, &hkProcessEvent, reinterpret_cast<LPVOID*>(&oProcessEvent)) != MH_OK) {
+        std::cout << "[ERROR] CreateHook failed.\n";
+        return 1;
+    }
+
+    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+        std::cout << "[ERROR] EnableHook failed.\n";
+        return 1;
+    }
+
+    std::cout << "[HOOK] Hook installed at 0x" << std::hex << ProcessEventAddr << std::dec << "\n";
+    std::cout << "[INFO] Press F3 (Toggle), F4 (Debug), END (Unload)\n";
 
     while (true) {
         if (GetAsyncKeyState(VK_END) & 1) break;
 
         if (GetAsyncKeyState(VK_F3) & 1) {
-            Config::bEnabled = !Config::bEnabled;
-            std::cout << "[TOGGLE] Auto-Parry: " << (Config::bEnabled ? "ON" : "OFF") << "\n";
+            bool b = !Globals::bAutoParryEnabled;
+            Globals::bAutoParryEnabled = b;
+            std::cout << "[TOGGLE] Auto-Parry: " << (b ? "ON" : "OFF") << "\n";
+            Sleep(200); // Debounce
         }
 
         if (GetAsyncKeyState(VK_F4) & 1) {
-            Config::bDebugMode = !Config::bDebugMode;
-            std::cout << "[TOGGLE] Debug Log: " << (Config::bDebugMode ? "ON" : "OFF") << "\n";
+            bool b = !Globals::bDebugMode;
+            Globals::bDebugMode = b;
+            std::cout << "[TOGGLE] Debug Log: " << (b ? "ON" : "OFF") << "\n";
+            Sleep(200); // Debounce
         }
 
-        if (Config::bEnabled && World) {
-            if (World->OwningGameInstance && World->OwningGameInstance->LocalPlayers.IsValidIndex(0)) {
-                auto LP = World->OwningGameInstance->LocalPlayers[0];
-                if (LP && LP->PlayerController && LP->PlayerController->Pawn) {
-                    auto Pawn = LP->PlayerController->Pawn;
-                    if (Pawn->IsA(SDK::AMordhauCharacter::StaticClass())) {
-                        AutoParryTick(World, static_cast<SDK::AMordhauCharacter*>(Pawn), LP->PlayerController);
-                    }
-                }
-            }
+        // Update Local Character slowly
+        if (World && World->OwningGameInstance && World->OwningGameInstance->LocalPlayers.IsValidIndex(0)) {
+             auto LP = World->OwningGameInstance->LocalPlayers[0];
+             if (LP && LP->PlayerController) {
+                 Globals::LocalController = LP->PlayerController;
+                 if (LP->PlayerController->Pawn) {
+                     auto Pawn = LP->PlayerController->Pawn;
+                     if (Pawn->IsA(SDK::AMordhauCharacter::StaticClass())) {
+                         Globals::LocalCharacter = static_cast<SDK::AMordhauCharacter*>(Pawn);
+                     } else {
+                         Globals::LocalCharacter = nullptr;
+                     }
+                 }
+             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
+    std::cout << "[INFO] Unloading...\n";
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
+    
+    // Small sleep to ensure hooks are exited
+    Sleep(100);
 
     FreeConsole();
     FreeLibraryAndExitThread(hModule, 0);
