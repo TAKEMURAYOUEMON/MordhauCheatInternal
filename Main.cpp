@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 
 // ОТКЛЮЧЕНИЕ МУСОРНЫХ ВАРНИНГОВ SDK
 #pragma warning(disable: 4369)
@@ -16,6 +16,8 @@
 #include <thread>
 #include <algorithm> 
 #include <cstdio> // Явно включаем для freopen
+#include <atomic>
+#include "MinHook.h"
 
 // ПОДКЛЮЧЕНИЕ ТВОЕГО SDK
 #include "SDK/Engine_classes.hpp"
@@ -101,6 +103,67 @@ void PressParry() {
     // Чистый WinAPI для симуляции нажатия правой кнопки мыши
     mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
     mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+}
+
+// =================================================================================
+// 🪝 HOOK FRAMEWORK
+// =================================================================================
+
+constexpr uintptr_t kCharacterOnHitRVA = 0x1678F60;
+constexpr const char* kOnHitSignature = "\x48\x89\x5C\x24\x00\x57\x48\x83\xEC\x00\x41\x8B\x41\x00\x48\x8B\xF9\x00\x00\x00\x00\x00\x00\x00\x00\x89\x44\x24\x00\x0F\xB6\x44\x24";
+constexpr const char* kOnHitMask = "xxxx?xxxx?xxx?xxx????????xxx?xxxx";
+
+typedef void(*OnHit_t)(SDK::AAdvancedCharacter* This, SDK::AActor* Actor, SDK::FName bone, const SDK::FVector& WorldLocation, uint8_t Tier, uint8_t SurfaceType);
+OnHit_t oOnHit = nullptr;
+
+void Detour_OnHit(SDK::AAdvancedCharacter* This, SDK::AActor* Actor, SDK::FName bone, const SDK::FVector& WorldLocation, uint8_t Tier, uint8_t SurfaceType) {
+    if (Config::bDebugMode) {
+        std::cout << "[HOOK] OnHit Triggered on " << (This ? This->GetName() : "NULL") << "\n";
+    }
+
+    if (oOnHit) {
+        oOnHit(This, Actor, bone, WorldLocation, Tier, SurfaceType);
+    }
+}
+
+std::atomic<bool> bHooksInstalled = false;
+
+void InstallHooks() {
+    if (bHooksInstalled) return;
+
+    if (MH_Initialize() != MH_OK) {
+        std::cout << "[HOOK] Failed to initialize MinHook.\n";
+        return;
+    }
+
+    uintptr_t baseAddress = (uintptr_t)GetModuleHandle(NULL);
+    uintptr_t targetAddress = baseAddress + kCharacterOnHitRVA;
+
+    std::cout << "[HOOK] Target Address (OnHit): " << (void*)targetAddress << "\n";
+
+    if (MH_CreateHook((LPVOID)targetAddress, (LPVOID)&Detour_OnHit, (LPVOID*)&oOnHit) != MH_OK) {
+        std::cout << "[HOOK] Failed to create OnHit hook.\n";
+        return;
+    }
+
+    if (MH_EnableHook((LPVOID)targetAddress) != MH_OK) {
+        std::cout << "[HOOK] Failed to enable OnHit hook.\n";
+        return;
+    }
+
+    bHooksInstalled = true;
+    std::cout << "[HOOK] Hooks installed successfully.\n";
+}
+
+void RemoveHooks() {
+    if (!bHooksInstalled) return;
+
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_RemoveHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
+
+    bHooksInstalled = false;
+    std::cout << "[HOOK] Hooks removed.\n";
 }
 
 // =================================================================================
@@ -280,6 +343,9 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     // Если твой SDK требует инициализации GEngine, то раскомментируй, если нет - оставь закомментированным:
     // SDK::UEngine::GetEngine(); 
 
+    // INSTALL HOOKS HERE
+    InstallHooks();
+
     std::cout << "[SUCCESS] Ready! Press F3(Parry), F4(Debug), END(Unload).\n";
 
     float PingCompensation = Config::SimulatedPing * 0.65f;
@@ -313,6 +379,9 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+
+    // REMOVE HOOKS HERE
+    RemoveHooks();
 
     FreeConsole();
     FreeLibraryAndExitThread(hModule, 0);
