@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 
 // ОТКЛЮЧЕНИЕ МУСОРНЫХ ВАРНИНГОВ SDK
 #pragma warning(disable: 4369)
@@ -7,6 +7,7 @@
 #pragma warning(disable: 4616)
 #pragma warning(disable: 2039) 
 
+#include "MinHook.h"
 #include <Windows.h>
 #include <iostream>
 #include <vector>
@@ -104,11 +105,74 @@ void PressParry() {
 }
 
 // =================================================================================
+// 🪝 HOOKS & GLOBALS
+// =================================================================================
+
+SDK::AMordhauCharacter* g_LocalChar = nullptr;
+
+// 1. Hook Signature
+typedef void(__fastcall* OnHitFunc)(SDK::AAdvancedCharacter*, SDK::AActor*, SDK::FName, const SDK::FVector*, uint8_t, uint8_t);
+static OnHitFunc OriginalOnHit = nullptr;
+
+// 2. Hook Callback
+void __fastcall OnHitHook(SDK::AAdvancedCharacter* thisPtr, SDK::AActor* Actor, SDK::FName Bone, const SDK::FVector* WorldLocation, uint8_t Tier, uint8_t SurfaceType) {
+    
+    // Always call original first or last? Ticket says "ALWAYS call OriginalOnHit() to preserve damage processing"
+    // Usually better to call it after our logic if we want to react, or before?
+    // "Implement the callback that triggers parrying when enemy attacks."
+    // If we parry, does it block the damage?
+    // "Trigger PressParry() ... ALWAYS call OriginalOnHit()"
+    
+    // We'll run our logic first to parry 'on hit' (rage parry), then let game process hit.
+    
+    if (Config::bEnabled && g_LocalChar && thisPtr == g_LocalChar) {
+        if (Actor && Actor->IsA(SDK::AMordhauCharacter::StaticClass())) {
+            SDK::AMordhauCharacter* Attacker = static_cast<SDK::AMordhauCharacter*>(Actor);
+            
+            // Log("[DEBUG] OnHit! Attacker: %s", Attacker->GetName().c_str());
+
+            if (Attacker->MotionSystemComponent && Attacker->MotionSystemComponent->Motion) {
+                auto Motion = Attacker->MotionSystemComponent->Motion;
+                if (Motion->IsA(SDK::UAttackMotion::StaticClass())) {
+                    // Check Stage
+                    const int ATTACK_STAGE_OFFSET = 0x10E9;
+                    EAttackStage Stage = *reinterpret_cast<EAttackStage*>((uintptr_t)Motion + ATTACK_STAGE_OFFSET);
+                    
+                    if (Stage == EAttackStage::Release) {
+                         // Rate Limit
+                         static auto LastParryTime = std::chrono::steady_clock::time_point();
+                         auto Now = std::chrono::steady_clock::now();
+                         auto TimeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(Now - LastParryTime).count();
+
+                         if (TimeDiff > 100) { // 100ms cooldown
+                             PressParry();
+                             LastParryTime = Now;
+                             if (Config::bDebugMode) {
+                                 Log("[RAGE PARRY] Triggered on %s (Stage: Release)", Attacker->GetName().c_str());
+                             }
+                         }
+                    } else if (Config::bDebugMode) {
+                         Log("[RAGE PARRY] Skipped - Stage not Release (%d)", (int)Stage);
+                    }
+                }
+            }
+        }
+    }
+
+    if (OriginalOnHit) {
+        OriginalOnHit(thisPtr, Actor, Bone, WorldLocation, Tier, SurfaceType);
+    }
+}
+
+// =================================================================================
 // ⚔️ ЛОГИКА
 // =================================================================================
 
 void AutoParryTick(SDK::UWorld* World, SDK::AMordhauCharacter* LocalChar, SDK::APlayerController* PlayerController) {
     if (!World || !LocalChar || !LocalChar->Mesh || !PlayerController) return;
+    
+    // Update global local char for hook
+    g_LocalChar = LocalChar;
 
     // КРИТИЧЕСКИЙ ОФФСЕТ (для AttackStage)
     const int ATTACK_STAGE_OFFSET = 0x10E9;
@@ -280,6 +344,43 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     // Если твой SDK требует инициализации GEngine, то раскомментируй, если нет - оставь закомментированным:
     // SDK::UEngine::GetEngine(); 
 
+    // INIT HOOKS
+    std::cout << "[INFO] Initializing MinHook...\n";
+    if (MH_Initialize() != MH_OK) {
+        std::cout << "[ERROR] MinHook Initialize Failed!\n";
+    } else {
+        // Find OnHit Function
+        // Assuming AAdvancedCharacter is available (base of AMordhauCharacter)
+        auto AdvCharClass = SDK::AMordhauCharacter::StaticClass(); // Using subclass to find function in hierarchy
+        // OR: auto AdvCharClass = SDK::UObject::FindClass("Class Mordhau.AdvancedCharacter");
+        
+        if (AdvCharClass) {
+            auto OnHitFuncObj = AdvCharClass->GetFunction("AdvancedCharacter", "OnHit");
+            if (OnHitFuncObj) {
+                std::cout << "[INFO] Found OnHit UFunction at " << OnHitFuncObj << "\n";
+                // Hacky access to Func pointer. Offset 0xE0 is common for UE4.26
+                void* NativeFunc = *reinterpret_cast<void**>((uintptr_t)OnHitFuncObj + 0xE0);
+                
+                if (NativeFunc) {
+                    std::cout << "[INFO] Native OnHit Address: " << NativeFunc << "\n";
+                    MH_STATUS status = MH_CreateHook(NativeFunc, &OnHitHook, (void**)&OriginalOnHit);
+                    if (status == MH_OK) {
+                        MH_EnableHook(NativeFunc);
+                        std::cout << "[SUCCESS] OnHit Hook Enabled!\n";
+                    } else {
+                        std::cout << "[ERROR] MH_CreateHook Failed: " << MH_StatusToString(status) << "\n";
+                    }
+                } else {
+                    std::cout << "[ERROR] NativeFunc pointer is NULL. Offset 0xE0 might be wrong.\n";
+                }
+            } else {
+                std::cout << "[ERROR] Could not find AdvancedCharacter::OnHit UFunction.\n";
+            }
+        } else {
+            std::cout << "[ERROR] Could not find AMordhauCharacter class.\n";
+        }
+    }
+
     std::cout << "[SUCCESS] Ready! Press F3(Parry), F4(Debug), END(Unload).\n";
 
     float PingCompensation = Config::SimulatedPing * 0.65f;
@@ -313,6 +414,10 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+
+    // Unhook
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
 
     FreeConsole();
     FreeLibraryAndExitThread(hModule, 0);
